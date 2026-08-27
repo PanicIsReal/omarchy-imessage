@@ -1,4 +1,6 @@
 import QtQuick
+import QtQuick.Controls
+import QtQuick.Dialogs
 import Quickshell
 import qs.Commons
 import qs.Ui
@@ -14,17 +16,27 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
   property var imsg: null
-  property int selectedChatId: 0
+  property var selectedChatId: ""
   property string draftText: ""
+  property int phraseIndex: 0
+  property bool settingsOpen: false
+  property bool pinThreadToEnd: true
+  property bool stickingThread: false
+  property int stickGen: 0
 
   readonly property var barIdentity: hostWidget || root
-  readonly property color dim: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.15)
-  readonly property color wash: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.08)
-  readonly property color washStrong: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.14)
+  readonly property color fg: bar ? bar.foreground : Color.foreground
+  readonly property string family: bar ? bar.fontFamily : Style.font.family
+  readonly property color dim: Qt.darker(fg, 1.4)
+  readonly property color urgent: Color.urgent
+  readonly property color hoverFill: Style.hoverFillFor(fg, Color.accent)
+  readonly property color selectedFill: Style.selectedFillFor(fg, Color.accent)
+  readonly property color normalFill: Style.normalFillFor(fg, Color.accent)
+
   readonly property string currentTitle: {
-    if (!imsg || !imsg.chats || selectedChatId <= 0) return ""
+    if (!imsg || !imsg.chats || !Models.hasId(selectedChatId)) return ""
     for (var i = 0; i < imsg.chats.length; i++) {
-      if (imsg.chats[i].id === selectedChatId) return Models.chatTitle(imsg.chats[i])
+      if (Models.sameId(imsg.chats[i].id, selectedChatId)) return Models.chatTitle(imsg.chats[i])
     }
     return ""
   }
@@ -33,21 +45,39 @@ Panel {
     cacheReady: false,
     statusKnown: false,
     bridgeConnected: false,
-    databaseReady: false,
-    lastError: "",
-    contacts: "unknown"
+    contacts: "unknown",
+    namesVisible: false,
+    passwordSet: false
   })
+  readonly property bool settingsVisible: root.settingsOpen || root.setupGuide.phase === "needs-settings"
   readonly property bool setupReady: root.setupGuide.phase === "ready"
+  readonly property var livePhrases: [
+    "Delivering bubbles",
+    "Keeping the thread",
+    "Sorting pings",
+    "Reading the tape"
+  ]
+  readonly property string heroMeta: {
+    if (!imsg) return "Starting"
+    if (imsg.linkState === "live") return livePhrases[phraseIndex % livePhrases.length]
+    if (imsg.linkState === "mac-down") return "Mac link is down"
+    if (imsg.linkState === "sync-down") return "Sync is down"
+    if (imsg.linkState === "checking") return "Checking the Mac"
+    return "Waiting"
+  }
+  readonly property string heroDetail: {
+    if (!imsg || !imsg.unreadCount) return ""
+    return String(imsg.unreadCount)
+  }
   readonly property string statusLine: {
     if (!imsg) return ""
     if (imsg.sendError && imsg.sendError.length > 0) return imsg.sendError
-    if (imsg.linkState === "mac-locked") return "Messages is locked on your Mac. Grant Full Disk Access to Ghostty."
     if (imsg.linkState === "mac-down") return "Showing saved messages. The Mac link is down."
     return ""
   }
 
   function maybeSelectFirst() {
-    if (selectedChatId > 0 || !imsg || !imsg.chats || imsg.chats.length === 0) return
+    if (Models.hasId(selectedChatId) || !imsg || !imsg.chats || imsg.chats.length === 0) return
     openChat(imsg.chats[0].id)
   }
 
@@ -56,13 +86,13 @@ Panel {
     if (imsg) {
       imsg.refreshChats()
       imsg.refreshStatus()
-      if (selectedChatId > 0) openChat(selectedChatId)
+      if (Models.hasId(selectedChatId)) openChat(selectedChatId)
       else maybeSelectFirst()
     }
   }
 
   function close() {
-    if (imsg) imsg.openChatId = 0
+    if (imsg) imsg.openChatId = ""
     root.controller.hide()
   }
 
@@ -71,19 +101,89 @@ Panel {
     else open()
   }
 
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    return false
+  }
+
   function openChat(chatId) {
-    selectedChatId = chatId
+    selectedChatId = String(chatId || "")
     draftText = ""
+    root.pinThreadToEnd = true
     if (imsg) {
-      imsg.openChatId = chatId
-      imsg.loadMessages(chatId, null)
+      imsg.openChatId = selectedChatId
+      imsg.markRead(selectedChatId)
+      imsg.loadMessages(selectedChatId, null)
     }
+    root.stickThread()
   }
 
   function sendDraft() {
-    if (!imsg || selectedChatId <= 0 || draftText.trim().length === 0) return
-    imsg.sendMessage(selectedChatId, draftText)
-    draftText = ""
+    if (!imsg || !Models.hasId(selectedChatId) || draftText.trim().length === 0 || imsg.sending) return
+    var text = draftText
+    root.draftText = ""
+    if (draftField) draftField.text = ""
+    imsg.sendMessage(selectedChatId, text)
+    root.stickThread()
+    root.focusComposer()
+  }
+
+  function pickAttachment() {
+    if (!Models.hasId(selectedChatId) || (imsg && imsg.sending)) return
+    photoDialog.open()
+  }
+
+  function focusComposer() {
+    if (root.settingsVisible) return
+    if (Models.hasId(selectedChatId) && draftField.enabled) draftField.forceActiveFocus()
+    else keyCatcher.forceActiveFocus()
+  }
+
+  function blurComposer() {
+    keyCatcher.forceActiveFocus()
+  }
+
+  function threadAtEnd() {
+    if (!threadView || threadView.height <= 0) return true
+    return (threadView.contentHeight - threadView.height - threadView.contentY) <= 24
+  }
+
+  function stickThread() {
+    if (!root.pinThreadToEnd || !threadView) return
+    var gen = ++root.stickGen
+    root.stickingThread = true
+    if (threadView.count > 0) threadView.positionViewAtIndex(threadView.count - 1, ListView.End)
+    Qt.callLater(function () {
+      if (gen !== root.stickGen) return
+      if (root.pinThreadToEnd && threadView.count > 0)
+        threadView.positionViewAtIndex(threadView.count - 1, ListView.End)
+      root.stickingThread = false
+    })
+  }
+
+  function composerKey(event) {
+    if (event.key === Qt.Key_Escape) {
+      root.blurComposer()
+      event.accepted = true
+      return
+    }
+    if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+      root.switchPanel((event.modifiers & Qt.ShiftModifier) || event.key === Qt.Key_Backtab ? -1 : 1)
+      event.accepted = true
+    }
+  }
+
+  function moveChat(delta) {
+    if (!imsg || !imsg.chats || imsg.chats.length === 0 || delta === 0) return
+    var i = 0
+    for (; i < imsg.chats.length; i++) {
+      if (Models.sameId(imsg.chats[i].id, selectedChatId)) break
+    }
+    if (i >= imsg.chats.length) i = 0
+    var n = Math.max(0, Math.min(imsg.chats.length - 1, i + delta))
+    openChat(imsg.chats[n].id)
+    chatList.positionViewAtIndex(n, ListView.Contain)
   }
 
   function call(method, args) {
@@ -95,6 +195,35 @@ Panel {
     return "unknown"
   }
 
+  Timer {
+    id: phraseTimer
+    interval: 2800
+    running: root.opened && imsg && imsg.linkState === "live"
+    repeat: true
+    onTriggered: phraseSwap.restart()
+  }
+
+  SequentialAnimation {
+    id: phraseSwap
+    PropertyAnimation {
+      target: hero
+      property: "metaOpacity"
+      to: 0.0
+      duration: 180
+      easing.type: Easing.OutQuad
+    }
+    ScriptAction {
+      script: root.phraseIndex = (root.phraseIndex + 1) % root.livePhrases.length
+    }
+    PropertyAnimation {
+      target: hero
+      property: "metaOpacity"
+      to: 1.0
+      duration: 260
+      easing.type: Easing.InQuad
+    }
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -103,33 +232,98 @@ Panel {
     open: root.opened
     centerOnBar: true
     gap: Style.space(16)
-    focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(720))
     contentHeight: panel.cappedContentHeight(Style.space(540))
+    focusTarget: keyCatcher
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       clip: true
-      blocked: draftField.activeFocus
+      blocked: settingsForm.editing || draftField.activeFocus
+      onMoveRequested: function(dx, dy) {
+        if (dx > 0) root.focusComposer()
+        if (dy !== 0) root.moveChat(dy)
+      }
       onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onReturnRequested: root.focusComposer()
+      onTextKey: function(t) {
+        if (t === "a") root.pickAttachment()
+      }
 
-      Item {
-        id: content
+      Column {
+        id: column
         anchors.fill: parent
-        clip: true
+        spacing: Style.space(12)
+
+        Item {
+          id: header
+          width: parent.width
+          implicitHeight: hero.implicitHeight
+          height: hero.height
+          function toggleSettings() {
+            root.settingsOpen = !root.settingsOpen
+          }
+
+          PanelHero {
+            id: hero
+            width: parent.width
+            title: "iMessage"
+            meta: root.heroMeta
+            detail: root.heroDetail
+            foreground: root.fg
+            fontFamily: root.family
+            iconOpacity: imsg && imsg.linkState === "live" ? 1.0 : 0.55
+            iconComponent: Component {
+              Text {
+                text: "󰍩"
+                color: root.fg
+                font.family: root.family
+                font.pixelSize: Style.font.display
+              }
+            }
+            trailingControl: Component {
+              Button {
+                iconText: "󰒓"
+                tooltipText: "Settings"
+                foreground: hero.foreground
+                fontFamily: hero.fontFamily
+                onClicked: header.toggleSettings()
+              }
+            }
+          }
+        }
+
+        SettingsForm {
+          id: settingsForm
+          width: parent.width
+          visible: root.settingsVisible
+          serverUrl: imsg && imsg.settings ? imsg.settings.server_url : ""
+          passwordSet: imsg && imsg.settings ? !!imsg.settings.password_set : false
+          session: imsg && imsg.settings ? String(imsg.settings.session) : "unconfigured"
+          saving: !!(imsg && imsg.settingsSaving)
+          foreground: root.fg
+          fontFamily: root.family
+          lastError: imsg ? imsg.lastError : ""
+          onSaveRequested: function (url, password) {
+            if (imsg) imsg.saveSettings(url, password)
+          }
+          onReconnectRequested: if (imsg) imsg.reconnect()
+        }
 
         Column {
-          id: setupCard
-          visible: !root.setupReady
-          anchors.centerIn: parent
-          width: Math.min(parent.width - Style.space(48), Style.space(420))
+          visible: !root.setupReady && !root.settingsVisible
+          width: parent.width
           spacing: Style.space(12)
 
           Text {
             width: parent.width
+            topPadding: Style.space(24)
             text: root.setupGuide.title
-            color: root.barForeground
+            color: root.fg
+            font.family: root.family
+            font.pixelSize: Style.font.title
             font.bold: true
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
@@ -137,283 +331,355 @@ Panel {
           Text {
             width: parent.width
             text: root.setupGuide.body
-            color: root.barForeground
+            color: root.dim
+            font.family: root.family
+            font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
-            opacity: 0.85
           }
           TextEdit {
             width: parent.width
             visible: root.setupGuide.hint && root.setupGuide.hint.length > 0
             text: root.setupGuide.hint || ""
-            color: root.barForeground
+            color: root.dim
             readOnly: true
             selectByMouse: true
             wrapMode: TextEdit.Wrap
-            font.family: "monospace"
+            font.family: root.family
             font.pixelSize: Style.font.caption
             horizontalAlignment: TextEdit.AlignHCenter
-            opacity: 0.7
           }
         }
 
         Row {
           id: panes
-          visible: root.setupReady
-          anchors.fill: parent
-          spacing: Style.space(8)
+          visible: root.setupReady && !root.settingsOpen
+          width: parent.width
+          height: parent.height - header.height - parent.spacing
+          spacing: Style.space(12)
 
-        Item {
-          id: chatPane
-          width: Math.floor(parent.width * 0.34)
-          height: parent.height
-          clip: true
+          Column {
+            id: chatPane
+            width: Math.max(Style.space(220), Math.floor(parent.width * 0.32))
+            height: parent.height
+            spacing: Style.space(10)
 
-          Rectangle {
-            anchors.fill: parent
-            color: "transparent"
-            border.color: root.dim
-          }
+            PanelSectionHeader {
+              id: chatsHeader
+              width: parent.width
+              text: "CHATS"
+              foreground: root.fg
+              fontFamily: root.family
+            }
 
-          ListView {
-            id: chatList
-            anchors.fill: parent
-            anchors.margins: Style.space(4)
-            model: imsg ? imsg.chats : []
-            clip: true
-            delegate: Rectangle {
-              width: chatList.width
-              height: chatRow.implicitHeight + Style.space(8)
-              color: selectedChatId === modelData.id ? root.washStrong : "transparent"
-              radius: 4
+            ListView {
+              id: chatList
+              width: parent.width
+              height: parent.height - chatsHeader.height - parent.spacing
+              model: imsg ? imsg.chats : []
+              clip: true
+              spacing: Style.space(6)
+              boundsBehavior: Flickable.StopAtBounds
+              highlightFollowsCurrentItem: false
+              currentIndex: -1
+              focus: false
+              activeFocusOnTab: false
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-              Column {
-                id: chatRow
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.margins: Style.space(4)
-                spacing: Style.space(2)
+              delegate: CursorSurface {
+                required property var modelData
+                width: chatList.width
+                implicitHeight: chatInfo.implicitHeight + Style.spacing.rowPaddingX
+                hasCursor: false
+                current: Models.sameId(root.selectedChatId, modelData.id)
+                foreground: root.fg
+                fill: root.hoverFill
+                currentFill: root.selectedFill
 
-                Text {
-                  width: parent.width
-                  text: Models.chatTitle(modelData)
-                  color: root.barForeground
-                  font.bold: true
-                  elide: Text.ElideRight
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openChat(modelData.id)
                 }
-                Row {
-                  width: parent.width
-                  spacing: Style.space(8)
+
+                Item {
+                  id: chatInfo
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  implicitHeight: Math.max(chatName.implicitHeight + chatMeta.implicitHeight + Style.space(2), Style.space(28))
 
                   Text {
+                    id: chatName
+                    anchors.left: parent.left
+                    anchors.right: unreadPill.left
+                    anchors.rightMargin: unreadPill.visible ? Style.space(8) : 0
+                    anchors.top: parent.top
+                    text: Models.chatTitle(modelData)
+                    color: root.fg
+                    font.family: root.family
+                    font.pixelSize: Style.font.body
+                    font.bold: (modelData.unread_count || 0) > 0
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    id: chatMeta
+                    anchors.left: parent.left
+                    anchors.right: unreadPill.left
+                    anchors.rightMargin: unreadPill.visible ? Style.space(8) : 0
+                    anchors.top: chatName.bottom
+                    anchors.topMargin: Style.space(1)
                     text: Models.formatTime(modelData.last_message_at)
-                    color: root.barForeground
-                    opacity: 0.6
+                    color: root.dim
+                    font.family: root.family
                     font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
                   }
-                  Text {
+
+                  BorderSurface {
+                    id: unreadPill
                     visible: (modelData.unread_count || 0) > 0
-                    text: String(modelData.unread_count || 0)
-                    color: root.barForeground
-                    opacity: 0.7
-                    font.pixelSize: Style.font.caption
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    implicitWidth: unreadText.implicitWidth + Style.space(10)
+                    implicitHeight: unreadText.implicitHeight + Style.space(4)
+                    color: "transparent"
+                    borderSpec: Border.controlSpec("normal", root.fg, Color.accent)
+                    radius: Style.cornerRadius
+
+                    Text {
+                      id: unreadText
+                      anchors.centerIn: parent
+                      text: String(modelData.unread_count || 0)
+                      color: root.dim
+                      font.family: root.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
                   }
                 }
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                onClicked: root.openChat(modelData.id)
               }
             }
           }
-        }
 
-        Item {
-          id: threadPane
-          width: parent.width - chatPane.width - parent.spacing
-          height: parent.height
-          clip: true
-
-          Text {
-            id: statusText
-            anchors.top: parent.top
-            width: parent.width
-            height: root.statusLine.length > 0 ? Style.space(36) : 0
-            visible: height > 0
-            clip: true
-            text: root.statusLine
-            color: imsg && imsg.sendError && imsg.sendError.length > 0 ? "#ff6b6b" : root.barForeground
-            opacity: 0.8
-            wrapMode: Text.WordWrap
-            maximumLineCount: 2
-            elide: Text.ElideRight
-            font.pixelSize: Style.font.caption
+          Rectangle {
+            width: 1
+            height: parent.height
+            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
           }
 
           Item {
-            id: contactsRow
-            anchors.top: statusText.bottom
-            anchors.topMargin: visible ? Style.space(4) : 0
-            width: parent.width
-            height: visible ? Style.space(28) : 0
-            visible: root.setupGuide.actionKind === "contacts" || (imsg && imsg.contactsState === "prompting")
-            clip: true
+            id: threadPane
+            width: parent.width - chatPane.width - parent.spacing * 2 - 1
+            height: parent.height
 
-            WidgetButton {
-              anchors.fill: parent
-              visible: root.setupGuide.actionKind === "contacts"
-              bar: root.bar
-              text: "Show contact names…"
-              onPressed: function() { imsg.requestContactsAccess() }
-            }
-            Text {
-              anchors.fill: parent
-              visible: imsg && imsg.contactsState === "prompting"
-              text: "Click Allow on your Mac to show contact names."
-              color: root.barForeground
-              opacity: 0.8
-              wrapMode: Text.WordWrap
-              elide: Text.ElideRight
-              font.pixelSize: Style.font.caption
-              verticalAlignment: Text.AlignVCenter
-            }
-          }
+            Column {
+              id: threadHeader
+              anchors.top: parent.top
+              width: parent.width
+              spacing: Style.space(8)
 
-          Text {
-            id: threadTitle
-            anchors.top: contactsRow.bottom
-            anchors.topMargin: contactsRow.visible || statusText.visible ? Style.space(4) : 0
-            width: parent.width
-            height: root.currentTitle.length > 0 ? Style.space(22) : 0
-            visible: height > 0
-            text: root.currentTitle
-            color: root.barForeground
-            font.bold: true
-            elide: Text.ElideRight
-          }
+              Text {
+                width: parent.width
+                visible: root.statusLine.length > 0
+                text: root.statusLine
+                color: imsg && imsg.sendError && imsg.sendError.length > 0 ? root.urgent : root.dim
+                font.family: root.family
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
 
-          ListView {
-            id: threadView
-            anchors.top: threadTitle.bottom
-            anchors.topMargin: threadTitle.visible ? Style.space(4) : 0
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: composerRow.top
-            anchors.bottomMargin: Style.space(8)
-            model: imsg ? imsg.messages : []
-            clip: true
-            spacing: Style.space(4)
-            boundsBehavior: Flickable.StopAtBounds
+              Button {
+                width: parent.width
+                visible: root.setupGuide.actionKind === "contacts"
+                text: "Show contact names"
+                foreground: root.fg
+                fontFamily: root.family
+                bordered: true
+                onClicked: if (imsg) imsg.requestContactsAccess()
+              }
 
-            onCountChanged: if (count > 0) positionViewAtEnd()
+              Text {
+                width: parent.width
+                visible: imsg && imsg.contactsState === "prompting"
+                text: "Click Allow on your Mac to show contact names."
+                color: root.dim
+                font.family: root.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
 
-            header: Item {
-              width: threadView.width
-              height: selectedChatId > 0 && imsg && imsg.messages && imsg.messages.length > 0 ? Style.space(28) : 0
-              WidgetButton {
-                anchors.fill: parent
-                visible: parent.height > 0
-                bar: root.bar
-                text: "Load older"
-                onPressed: function() {
-                  if (!imsg || imsg.messages.length === 0) return
-                  var oldest = imsg.messages[0]
-                  if (oldest && oldest.created_at) imsg.loadMessages(selectedChatId, oldest.created_at)
-                }
+              PanelSectionHeader {
+                width: parent.width
+                visible: root.currentTitle.length > 0
+                text: root.currentTitle
+                foreground: root.fg
+                fontFamily: root.family
               }
             }
 
-            delegate: Item {
-              visible: Models.messageText(modelData).length > 0
-              width: ListView.view ? ListView.view.width : 0
-              height: visible ? bubble.height + Style.space(4) : 0
+            ListView {
+              id: threadView
+              anchors.top: threadHeader.bottom
+              anchors.topMargin: Style.space(8)
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.bottom: composerRow.top
+              anchors.bottomMargin: Style.space(8)
+              model: imsg ? imsg.displayMessages : []
+              clip: true
+              spacing: Style.space(6)
+              boundsBehavior: Flickable.StopAtBounds
+              highlightFollowsCurrentItem: false
+              currentIndex: -1
+              focus: false
+              activeFocusOnTab: false
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-              Rectangle {
-                id: bubble
-                readonly property bool fromMe: modelData.is_from_me === true
-                anchors.left: fromMe ? undefined : parent.left
-                anchors.right: fromMe ? parent.right : undefined
-                width: Math.round(parent.width * 0.78)
-                height: bubbleText.implicitHeight + Style.space(16)
-                radius: 8
-                color: fromMe ? Qt.rgba(0.2, 0.5, 1, 0.35) : Qt.rgba(0, 0, 0, 0.08)
-                border.width: fromMe ? 0 : 1
-                border.color: fromMe ? "transparent" : root.dim
+              onCountChanged: if (root.pinThreadToEnd) root.stickThread()
+              onContentHeightChanged: if (root.pinThreadToEnd) root.stickThread()
+              onContentYChanged: {
+                if (root.stickingThread) return
+                if (moving || flicking || dragging) root.pinThreadToEnd = root.threadAtEnd()
+              }
+              onMovementEnded: if (!root.stickingThread) root.pinThreadToEnd = root.threadAtEnd()
 
-                Text {
-                  id: bubbleText
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.top: parent.top
-                  anchors.margins: Style.space(8)
-                  wrapMode: Text.Wrap
-                  text: Models.messageText(modelData)
-                  color: root.barForeground
-                  font.pixelSize: Style.font.body
+              header: Item {
+                width: threadView.width
+                height: Models.hasId(selectedChatId) && imsg && imsg.messages && imsg.messages.length > 0 ? Style.space(36) : 0
+                Button {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  visible: parent.height > 0
+                  text: "Load older"
+                  foreground: root.fg
+                  fontFamily: root.family
+                  fontSize: Style.font.caption
+                  bordered: true
+                  onClicked: {
+                    if (!imsg || imsg.messages.length === 0) return
+                    var oldest = imsg.messages[0]
+                    if (oldest && oldest.created_at) {
+                      root.pinThreadToEnd = false
+                      imsg.loadMessages(selectedChatId, oldest.created_at)
+                    }
+                  }
                 }
               }
-            }
-          }
 
-          Text {
-            anchors.centerIn: threadView
-            width: threadView.width * 0.8
-            visible: !imsg || !imsg.messages || imsg.messages.length === 0
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.WordWrap
-            color: root.barForeground
-            opacity: 0.45
-            font.pixelSize: Style.font.body
-            text: selectedChatId > 0 ? "No messages in this chat yet." : "Select a conversation."
-          }
+              delegate: Item {
+                visible: Models.messageText(modelData).length > 0 || Models.hasLocalPhoto(modelData)
+                width: ListView.view ? ListView.view.width : 0
+                height: visible ? bubble.height : 0
 
-          Row {
-            id: composerRow
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            height: Style.space(36)
-            spacing: Style.space(4)
+                BorderSurface {
+                  id: bubble
+                  readonly property bool fromMe: modelData.is_from_me === true
+                  anchors.left: fromMe ? undefined : parent.left
+                  anchors.right: fromMe ? parent.right : undefined
+                  width: Math.round(parent.width * 0.78)
+                  implicitHeight: bubbleCol.implicitHeight + Style.space(16)
+                  radius: Style.cornerRadius
+                  color: fromMe ? root.selectedFill : root.normalFill
+                  borderSpec: fromMe
+                    ? Border.none()
+                    : Border.controlSpec("normal", root.fg, Color.accent)
 
-            Rectangle {
-              width: parent.width - sendBtn.width - Style.space(4)
-              height: parent.height
-              radius: 8
-              color: root.wash
-              border.width: 1
-              border.color: root.dim
+                  Column {
+                    id: bubbleCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(4)
 
-              TextInput {
-                id: draftField
-                anchors.fill: parent
-                anchors.margins: Style.space(8)
-                text: root.draftText
-                onTextChanged: root.draftText = text
-                color: root.barForeground
-                font.pixelSize: Style.font.body
-                clip: true
-                selectByMouse: true
-                enabled: selectedChatId > 0 && imsg && !imsg.sending
-                Keys.onReturnPressed: function(event) {
-                  if (!(event.modifiers & Qt.ShiftModifier)) {
-                    event.accepted = true
-                    root.sendDraft()
+                    Image {
+                      visible: Models.hasLocalPhoto(modelData)
+                      width: parent.width
+                      height: visible ? Math.min(Style.space(180), implicitHeight > 0 ? implicitHeight : Style.space(120)) : 0
+                      fillMode: Image.PreserveAspectFit
+                      asynchronous: true
+                      source: visible ? ("file://" + String(modelData.local_path)) : ""
+                    }
+
+                    Text {
+                      id: bubbleText
+                      width: parent.width
+                      visible: Models.messageText(modelData).length > 0
+                      wrapMode: Text.Wrap
+                      text: Models.messageText(modelData)
+                      color: root.fg
+                      font.family: root.family
+                      font.pixelSize: Style.font.body
+                    }
+
+                    Text {
+                      width: parent.width
+                      visible: bubble.fromMe && (modelData.send_state === "sending" || modelData.send_state === "failed")
+                      text: modelData.send_state === "failed" ? "Not delivered" : "Sending"
+                      color: modelData.send_state === "failed" ? root.urgent : root.dim
+                      font.family: root.family
+                      font.pixelSize: Style.font.caption
+                    }
                   }
                 }
               }
             }
 
-            WidgetButton {
-              id: sendBtn
-              bar: root.bar
-              text: imsg && imsg.sending ? "…" : "Send"
-              enabled: selectedChatId > 0 && imsg && !imsg.sending && root.draftText.trim().length > 0
-              onPressed: function() { root.sendDraft() }
+            Text {
+              anchors.centerIn: threadView
+              width: threadView.width * 0.8
+              visible: (!imsg || !imsg.displayMessages || imsg.displayMessages.length === 0) && root.setupReady
+              horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.WordWrap
+              color: root.dim
+              font.family: root.family
+              font.pixelSize: Style.font.body
+              text: Models.hasId(selectedChatId) ? "No messages in this chat yet." : "Select a conversation."
+            }
+
+            Row {
+              id: composerRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              spacing: Style.space(8)
+
+              Button {
+                id: photoBtn
+                text: "Photo"
+                foreground: root.fg
+                fontFamily: root.family
+                enabled: Models.hasId(selectedChatId) && imsg && !imsg.sending
+                onClicked: root.pickAttachment()
+              }
+
+              TextField {
+                id: draftField
+                width: parent.width - sendBtn.width - photoBtn.width - parent.spacing * 2
+                foreground: root.fg
+                placeholderText: Models.hasId(selectedChatId) ? "Message" : "Select a conversation"
+                enabled: Models.hasId(selectedChatId)
+                text: root.draftText
+                onTextChanged: root.draftText = text
+                onAccepted: root.sendDraft()
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: root.composerKey(event)
+              }
+
+              Button {
+                id: sendBtn
+                text: imsg && imsg.sending ? "…" : "Send"
+                foreground: root.fg
+                fontFamily: root.family
+                enabled: Models.hasId(selectedChatId) && imsg && !imsg.sending && root.draftText.trim().length > 0
+                onClicked: root.sendDraft()
+              }
             }
           }
-        }
         }
       }
     }
@@ -423,6 +689,38 @@ Panel {
     target: imsg
     function onChatsChanged() {
       if (root.opened) root.maybeSelectFirst()
+      if (!imsg || !Models.hasId(selectedChatId) || !imsg.chats) return
+      for (var i = 0; i < imsg.chats.length; i++) {
+        if (Models.sameId(imsg.chats[i].id, selectedChatId) && (imsg.chats[i].unread_count || 0) > 0) {
+          imsg.markRead(selectedChatId)
+          break
+        }
+      }
+    }
+    function onMessagesChanged() {
+      if (root.pinThreadToEnd) root.stickThread()
+    }
+    function onDisplayMessagesChanged() {
+      if (root.pinThreadToEnd) root.stickThread()
+    }
+    function onFailedDraftChanged() {
+      if (!imsg || !imsg.failedDraft || imsg.failedDraft.length === 0) return
+      if (root.draftText.trim().length > 0) return
+      root.draftText = imsg.failedDraft
+      if (draftField) draftField.text = imsg.failedDraft
+    }
+  }
+
+  FileDialog {
+    id: photoDialog
+    title: "Send photo"
+    fileMode: FileDialog.OpenFile
+    nameFilters: ["Images (*.jpg *.jpeg *.png *.gif *.webp *.heic *.heif *.bmp)"]
+    onAccepted: {
+      var u = String(selectedFile)
+      if (u.indexOf("file://") === 0) u = decodeURIComponent(u.substring(7))
+      if (imsg) imsg.sendAttachment(selectedChatId, u)
+      root.stickThread()
     }
   }
 }

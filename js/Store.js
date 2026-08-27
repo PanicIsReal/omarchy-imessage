@@ -10,7 +10,16 @@ function applySnapshot(result) {
       database_ready: !!(result && result.database_ready),
       last_error: (result && result.last_error) ? result.last_error : "",
       contacts: (result && result.contacts) ? result.contacts : "unknown"
-    }
+    },
+    settings: settingsFrom(result)
+  }
+}
+
+function settingsFrom(result) {
+  return {
+    server_url: (result && result.server_url) ? String(result.server_url) : "",
+    password_set: !!(result && result.password_set),
+    session: (result && result.session) ? String(result.session) : "unconfigured"
   }
 }
 
@@ -22,7 +31,12 @@ function applyEvent(state, event) {
     return { chats: chats, unreadCount: totalUnread(chats) }
   }
   if (event.topic === "sync.link") {
-    return { link: event.payload || {} }
+    var payload = event.payload || {}
+    var patch = { link: payload }
+    if (payload.server_url !== undefined || payload.password_set !== undefined || payload.session !== undefined) {
+      patch.settings = settingsFrom(payload)
+    }
+    return patch
   }
   return {}
 }
@@ -34,12 +48,12 @@ function applyMessage(state, payload) {
     patch.unreadCount = totalUnread(patch.chats)
   }
   var msg = payload.message
-  if (msg && state.openChatId && Number(msg.chat_id) === Number(state.openChatId)) {
+  if (msg && state.openChatId && String(msg.chat_id) === String(state.openChatId)) {
     patch.messages = appendMessage(state.messages || [], msg)
   }
-  if (payload.is_new && msg && msg.is_from_me !== true && Number(msg.chat_id) !== Number(state.openChatId)) {
+  if (payload.is_new && msg && msg.is_from_me !== true && String(msg.chat_id) !== String(state.openChatId)) {
     patch.notify = {
-      sender: msg.sender_name || msg.sender || "iMessage",
+      sender: notifySender(msg, payload.chat || findChat(state.chats, msg.chat_id)),
       preview: msg.text || "",
       chatId: msg.chat_id
     }
@@ -51,7 +65,7 @@ function upsertChat(chats, chat) {
   var out = []
   var found = false
   for (var i = 0; i < chats.length; i++) {
-    if (chats[i].id === chat.id) {
+    if (String(chats[i].id) === String(chat.id)) {
       out.push(chat)
       found = true
     } else {
@@ -70,7 +84,7 @@ function upsertChat(chats, chat) {
 
 function appendMessage(messages, msg) {
   for (var i = 0; i < messages.length; i++) {
-    if (messages[i].id === msg.id) {
+    if (String(messages[i].id) === String(msg.id)) {
       var copy = messages.slice()
       copy[i] = msg
       return copy
@@ -79,10 +93,39 @@ function appendMessage(messages, msg) {
   return messages.concat([msg])
 }
 
+function isPersonName(value) {
+  return /[A-Za-z]/.test(String(value || ""))
+}
+
+function findChat(chats, chatId) {
+  chats = chats || []
+  for (var i = 0; i < chats.length; i++) {
+    if (String(chats[i].id) === String(chatId || "")) return chats[i]
+  }
+  return null
+}
+
+function notifySender(msg, chat) {
+  if (isPersonName(msg && msg.sender_name)) return msg.sender_name
+  if (isPersonName(chat && chat.contact_name)) return chat.contact_name
+  if (isPersonName(chat && chat.display_name)) return chat.display_name
+  if (isPersonName(chat && chat.name)) return chat.name
+  return String((msg && msg.sender) || "iMessage")
+}
+
 function totalUnread(chats) {
   var n = 0
   for (var i = 0; i < chats.length; i++) n += chats[i].unread_count || 0
   return n
+}
+
+function linkState(s) {
+  s = s || {}
+  if (!s.connected && !s.cacheReady) return "waiting"
+  if (!s.connected) return "sync-down"
+  if (!s.statusKnown) return "checking"
+  if (s.bridgeConnected) return "live"
+  return "mac-down"
 }
 
 function setupGuide(s) {
@@ -93,7 +136,7 @@ function setupGuide(s) {
       title: "",
       body: "",
       hint: "",
-      actionKind: s.contacts === "unavailable" ? "contacts" : ""
+      actionKind: (s.contacts === "unavailable" && !s.namesVisible) ? "contacts" : ""
     }
   }
   if (!s.connected) {
@@ -105,6 +148,15 @@ function setupGuide(s) {
       actionKind: ""
     }
   }
+  if (!s.passwordSet) {
+    return {
+      phase: "needs-settings",
+      title: "Link this machine",
+      body: "BlueBubbles URL and password. Saved in the system keyring.",
+      hint: "",
+      actionKind: "settings"
+    }
+  }
   if (!s.statusKnown) {
     return {
       phase: "checking",
@@ -114,11 +166,11 @@ function setupGuide(s) {
       actionKind: ""
     }
   }
-  if (s.bridgeConnected && !s.databaseReady) {
+  if (s.bridgeConnected && !s.cacheReady) {
     return {
-      phase: "needs-fda",
-      title: "Messages is locked on your Mac",
-      body: "Grant Full Disk Access to Ghostty, the window titled imsg-bridge-serve. The list appears after that.",
+      phase: "loading",
+      title: "Loading conversations",
+      body: "The Mac link is up. Chats appear here in a moment.",
       hint: "",
       actionKind: ""
     }
@@ -126,8 +178,8 @@ function setupGuide(s) {
   return {
     phase: "needs-mac",
     title: "This machine is not linked",
-    body: "The Mac needs Homebrew imsg and a running bridge. After that, pair from here with imsg setup pair <code> --host <mac-tailscale-ip>.",
-    hint: "brew install steipete/tap/imsg",
-    actionKind: ""
+    body: "BlueBubbles is running on the Mac. Point this machine at it in Settings.",
+    hint: "",
+    actionKind: "settings"
   }
 }
